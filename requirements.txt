@@ -1,0 +1,2 @@
+# Stage-1 foundation intentionally uses only the Python standard library.
+# External runtime dependency: tcpdump.

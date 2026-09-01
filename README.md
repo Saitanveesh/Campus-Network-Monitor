@@ -1,113 +1,155 @@
 # Campus Network Observatory
 
-A passive, evidence-driven campus network monitoring system designed for trustworthy live observability rather than synthetic or inferred network state.
+A passive, evidence-driven network monitoring system built around one rule: **if the sensor cannot currently prove it, the live board must not show it as fact.**
 
-## Stage 1 goal
+## Stage 1 foundation
 
-Build a robust monitoring core that can:
+The current branch implements a fresh architecture instead of continuing the old multi-terminal VM prototype.
 
-- automatically discover and select the active capture interface;
-- detect network, interface, address, route, and session changes;
-- isolate every live monitoring session from historical data;
-- capture packet metadata passively without active scanning;
-- create endpoint records only from defensible source-side evidence;
-- distinguish sensor, infrastructure, local endpoints, private off-subnet peers, public peers, broadcast, multicast, and special addresses;
-- expose current-session traffic, flows, ARP evidence, capture health, and topology;
-- fail closed when the capture or network state cannot be validated;
-- clear live state immediately when a session becomes invalid;
-- retain historical records separately from the live board.
+### What is different
 
-## Non-negotiable correctness rules
+- one Python process owns supervisor, capture, live state, API and web UI;
+- automatic interface discovery and election;
+- network fingerprinting and automatic session rotation;
+- live state exists only in memory and is destroyed on session invalidation;
+- historical sessions are stored separately in `data/history.db`;
+- dashboard/topology call only `/api/live/*` endpoints;
+- destination-only IP addresses cannot become local endpoints;
+- sensor, gateway/infrastructure, verified local endpoints and off-subnet peers are different classes;
+- binary PCAP parsing replaces free-form `tcpdump` text parsing;
+- capture health can report active, idle, stalled, parser failure or capture failure;
+- current topology is an observed communication relationship graph, not a claimed physical campus topology;
+- no active scanning is used.
 
-1. No evidence -> no live entity.
-2. Historical data must never enter the live dashboard or live topology.
-3. Every reconnect or network change creates a new session.
-4. A destination-only IP must never be promoted to a local endpoint.
-5. Sensor and gateway/infrastructure are classified separately from ordinary endpoints.
-6. External peers are never counted as local connected devices.
-7. Malformed, special, multicast, broadcast, loopback, and invalid addresses are never shown as ordinary devices.
-8. Every live entity carries provenance/evidence.
-9. If capture health is uncertain, the UI must clear and report the reason instead of showing stale values.
-10. No active network scanning is required for Stage 1.
-11. No automatic claim that an endpoint is malicious or compromised from a weak indicator.
-12. The observed topology is a communication relationship graph, not a claimed physical switch-by-switch topology.
-
-## Target architecture
+## Architecture
 
 ```text
-Operating system network state
-        |
-        v
-Sensor Supervisor
-  - interface discovery/election
-  - link/address/route validation
-  - network fingerprinting
-  - session lifecycle
-  - capture watchdog
-        |
-        v
-Session-aware Collector
-  - structured packet capture
-  - strict parsing/validation
-  - endpoint evidence
-  - flow/ARP evidence
-  - live TTLs
-        |
-        +----------------------+
-        |                      |
-        v                      v
-Live state store          History store
-(current session only)    (closed sessions only)
-        |
-        v
-Live API
-        |
-   +----+----+
-   |         |
-Dashboard  Observed Live Flow Map
+Linux network state
+      |
+      v
+Interface discovery/election
+      |
+      v
+Session supervisor
+      |
+      +---- network fingerprint changes ----> clear live state / archive old session
+      |
+      v
+Managed tcpdump binary-PCAP capture
+      |
+      v
+Strict Ethernet / IPv4 / ARP parser
+      |
+      v
+Thread-safe CURRENT SESSION state (memory only)
+      |                         |
+      |                         +----> isolated history archive
+      v
+Integrated HTTP API + Web UI
+      |
+      +---- /api/live/*
+      +---- /api/history/*
+      |
+      +---- Dashboard
+      +---- Observed Live Communication Topology
 ```
 
-## Planned repository layout
+## Repository layout
 
 ```text
-campus-network-observatory/
-  app/
-    supervisor.py
-    collector.py
-    api.py
-    launcher.py
-  web/
-    index.html
-    topology.html
-  tests/
-  docs/
-  config/
-  runtime/
-  data/
-  requirements.txt
-  README.md
+app/
+  __main__.py       # python -m app entrypoint
+  main.py           # preflight + one-command launcher
+  service.py        # supervisor/session lifecycle
+  network.py        # automatic interface discovery/election
+  capture.py        # managed tcpdump capture worker/watchdog
+  pcap.py           # binary PCAP + Ethernet/IPv4/ARP parser
+  state.py          # fail-closed current-session truth state
+  history.py        # closed-session archive only
+  server.py         # localhost API + static web server
+  config.py
+web/
+  index.html        # live board
+  topology.html     # packet-movement communication graph
+tests/
+  test_state.py
+  test_pcap.py
+data/               # runtime only; gitignored
 ```
 
-Runtime databases, packet-event snapshots, PID files, and logs must not be committed.
+## Kali setup
+
+The Python code uses only the standard library. `tcpdump` is the only external runtime dependency.
+
+```bash
+sudo apt install tcpdump libcap2-bin
+sudo setcap cap_net_raw,cap_net_admin=eip "$(readlink -f "$(which tcpdump)")"
+getcap "$(readlink -f "$(which tcpdump)")"
+```
+
+Expected capability output should include `cap_net_raw`.
+
+## Run
+
+```bash
+git clone https://github.com/Saitanveesh/Campus-Network-Monitor.git
+cd Campus-Network-Monitor
+git checkout stage1-foundation
+python3 -m unittest discover -s tests -v
+python3 -m app
+```
+
+Then open:
+
+- Dashboard: `http://127.0.0.1:8080/`
+- Live topology: `http://127.0.0.1:8080/topology.html`
+- Live status API: `http://127.0.0.1:8080/api/live/status`
+
+There is no second API process and no separate HTTP server.
+
+## Endpoint truth rules
+
+A local endpoint is created only when the sensor observes defensible source-side evidence:
+
+- `IPV4_SOURCE_FRAME`: valid local source IP paired with the observed Ethernet source MAC;
+- `ARP_SENDER`: valid ARP sender IP/MAC whose ARP sender MAC matches the Ethernet source MAC.
+
+The following do **not** create a local endpoint:
+
+- an IP appearing only as a destination;
+- public Internet peers;
+- private addresses outside the sensor subnet;
+- multicast/broadcast/special addresses;
+- malformed packets.
+
+## Live vs history boundary
+
+`LiveState` never reads the history database. On network loss or fingerprint change:
+
+1. capture stops;
+2. current live entities are snapshotted for history;
+3. in-memory endpoints/flows/ARP/packet feed/traffic samples are cleared;
+4. the live API fails closed until a valid capture session exists;
+5. a reconnect creates a new UUID session.
+
+The live dashboard and topology never call `/api/history/*`.
 
 ## Stage 1 closure gate
 
-Stage 1 will not be considered complete until the system passes at least these physical tests:
+Stage 1 is not complete until these real tests pass:
 
-- boot with no network;
-- connect a network after startup;
-- disconnect while monitoring;
-- reconnect to the same network;
-- switch between Wi-Fi and Ethernet;
-- change IP/subnet/gateway;
-- run with two usable interfaces simultaneously;
-- kill the collector during capture;
-- kill the API while the browser remains open;
-- restart with historical databases present;
-- remain on an idle but valid link;
-- reject malformed/unusable packet input;
-- verify that old-session endpoints and flows never reappear on the live board.
+- boot with no network -> `NETWORK_DOWN`, empty board;
+- connect after startup -> automatic interface selection and new session;
+- disconnect while monitoring -> board/topology clear;
+- reconnect same network -> fresh session without process restart;
+- Wi-Fi <-> Ethernet change -> automatic re-election/session rotation;
+- IPv4/subnet/gateway change -> new fingerprint/session;
+- two usable interfaces -> stable deterministic selection;
+- quiet link -> `LINK_UP_IDLE`, not fake offline data;
+- tcpdump/capture failure -> fail-closed state;
+- malformed input -> rejected, never displayed as a device;
+- restart with old `data/history.db` -> no historical entity appears on the live board.
 
-## Current development policy
+## Scope boundary
 
-This repository is the source of truth for all further development. Experimental code should be committed on branches and integrated only after its reliability checks pass.
+Stage 1 currently captures **Ethernet IPv4 + ARP**. IPv6, DNS/DHCP-specific intelligence, security correlation, host risk scoring and longer behavioural baselines belong after the sensing/reliability gate is closed.

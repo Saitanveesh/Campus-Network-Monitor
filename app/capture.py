@@ -25,7 +25,6 @@ class CaptureWorker:
         self._bytes = 0
         self._last_packet_at: Optional[float] = None
         self._last_os_rx: Optional[int] = None
-        self._stall_checks = 0
 
     @property
     def running(self) -> bool:
@@ -40,7 +39,6 @@ class CaptureWorker:
         self._bytes = 0
         self._last_packet_at = None
         self._last_os_rx = candidate.rx_packets
-        self._stall_checks = 0
         self._thread = threading.Thread(target=self._run, name="capture-worker", daemon=True)
         self._thread.start()
 
@@ -174,28 +172,18 @@ class CaptureWorker:
 
             current = time.time()
             if current - last_health >= 2.0:
-                os_rx = self._read_os_rx()
-                rx_delta = 0
-                if os_rx is not None and self._last_os_rx is not None:
-                    rx_delta = max(0, os_rx - self._last_os_rx)
-
                 packet_age = None if self._last_packet_at is None else current - self._last_packet_at
                 if packet_age is not None and packet_age <= SETTINGS.capture_idle_seconds:
-                    self._stall_checks = 0
                     status = "CAPTURE_ACTIVE"
-                    reason = "Current-session packets are actively being parsed."
-                elif rx_delta >= SETTINGS.os_rx_stall_threshold:
-                    self._stall_checks += 1
-                    if self._stall_checks >= 3:
-                        status = "CAPTURE_STALLED"
-                        reason = "OS RX counters are rising but the collector has no recent qualifying parsed packets."
-                    else:
-                        status = "LINK_UP_IDLE"
-                        reason = "Capture is running; validating a temporary RX/parser mismatch."
+                    reason = "Current-session IPv4/ARP packets are actively being parsed."
                 else:
-                    self._stall_checks = 0
+                    # The OS RX counter covers all layer-2 traffic, while Stage 1
+                    # deliberately captures only IPv4/ARP. A rising RX counter
+                    # therefore cannot prove the filtered capture is stalled; it
+                    # may simply be IPv6 or other traffic. Do not manufacture a
+                    # CAPTURE_STALLED state from incomparable counters.
                     status = "LINK_UP_IDLE"
-                    reason = "Link and capture are valid but no recent qualifying IPv4/ARP packet was observed."
+                    reason = "Capture process is healthy but no recent qualifying IPv4/ARP packet was observed. Other layer-2 traffic may still be present."
 
                 self._publish_health(status, reason)
                 last_health = current

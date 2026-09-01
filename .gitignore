@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime state: never commit live data or historical captures
+data/
+runtime/
+*.db
+*.db-wal
+*.db-shm
+*.pid
+*.log
+packet_events.json
+collector_runtime.json
+supervisor_state.json
+live_status.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,5 +1,6 @@
 import os
-import select
+import platform
+import queue
 import shutil
 import subprocess
 import threading
@@ -13,10 +14,38 @@ from .pcap import PcapStreamReader, parse_ethernet_packet
 from .state import LiveState
 
 
+def find_tshark() -> Optional[str]:
+    discovered = shutil.which("tshark") or shutil.which("tshark.exe")
+    if discovered:
+        return discovered
+
+    if platform.system().lower() == "windows":
+        candidates = [
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Wireshark" / "tshark.exe",
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Wireshark" / "tshark.exe",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+    return None
+
+
+def capture_backend() -> tuple[Optional[str], Optional[str]]:
+    system = platform.system().lower()
+    if system == "windows":
+        tshark = find_tshark()
+        return ("TSHARK_NPCAP_PCAP", tshark) if tshark else (None, None)
+    if system == "linux":
+        tcpdump = shutil.which("tcpdump")
+        return ("TCPDUMP_PCAP_BINARY", tcpdump) if tcpdump else (None, None)
+    return None, None
+
+
 class CaptureWorker:
     def __init__(self, state: LiveState):
         self.state = state
         self._thread: Optional[threading.Thread] = None
+        self._reader_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._process: Optional[subprocess.Popen] = None
         self._candidate: Optional[InterfaceCandidate] = None
@@ -25,6 +54,7 @@ class CaptureWorker:
         self._bytes = 0
         self._last_packet_at: Optional[float] = None
         self._last_os_rx: Optional[int] = None
+        self._backend_name = "NOT_CONFIGURED"
 
     @property
     def running(self) -> bool:
@@ -39,6 +69,7 @@ class CaptureWorker:
         self._bytes = 0
         self._last_packet_at = None
         self._last_os_rx = candidate.rx_packets
+        self._backend_name = "NOT_CONFIGURED"
         self._thread = threading.Thread(target=self._run, name="capture-worker", daemon=True)
         self._thread.start()
 
@@ -55,11 +86,19 @@ class CaptureWorker:
                     pass
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=1)
         self._thread = None
+        self._reader_thread = None
         self._process = None
 
     def _read_os_rx(self) -> Optional[int]:
         if not self._candidate:
+            return None
+        if platform.system().lower() != "linux":
+            # Windows adapter counters are refreshed by the supervisor. Capture
+            # health does not compare those sampled counters against filtered
+            # IPv4/ARP packet timestamps because the quantities are not equivalent.
             return None
         try:
             path = Path("/sys/class/net") / self._candidate.name / "statistics" / "rx_packets"
@@ -83,28 +122,60 @@ class CaptureWorker:
             captured_bytes=self._bytes,
             os_rx_packets=current_rx,
             os_rx_delta=rx_delta,
-            backend="TCPDUMP_PCAP_BINARY",
+            backend=self._backend_name,
         )
 
-    def _run(self) -> None:
-        tcpdump = shutil.which("tcpdump")
-        if not tcpdump:
-            self._publish_health("CAPTURE_ERROR", "tcpdump is not installed or not in PATH.")
-            return
+    def _command(self) -> Optional[list[str]]:
         assert self._candidate is not None
+        backend, executable = capture_backend()
+        if not backend or not executable:
+            return None
 
-        command = [
-            tcpdump,
+        self._backend_name = backend
+        capture_device = self._candidate.capture_device or self._candidate.name
+
+        if backend == "TSHARK_NPCAP_PCAP":
+            return [
+                executable,
+                "-n",
+                "-i",
+                capture_device,
+                "-f",
+                "ip or arp",
+                "-s",
+                "0",
+                "-F",
+                "pcap",
+                "-w",
+                "-",
+            ]
+
+        return [
+            executable,
             "-U",
             "-n",
             "-i",
-            self._candidate.name,
+            capture_device,
             "-s",
             "0",
             "-w",
             "-",
             "ip or arp",
         ]
+
+    def _run(self) -> None:
+        assert self._candidate is not None
+        command = self._command()
+        if command is None:
+            if platform.system().lower() == "windows":
+                self._publish_health(
+                    "CAPTURE_ERROR",
+                    "TShark/Wireshark with Npcap is not available. Install Wireshark with Npcap enabled.",
+                )
+            else:
+                self._publish_health("CAPTURE_ERROR", "tcpdump is not installed or not in PATH.")
+            return
+
         try:
             self._process = subprocess.Popen(
                 command,
@@ -113,38 +184,61 @@ class CaptureWorker:
                 bufsize=0,
             )
         except OSError as error:
-            self._publish_health("CAPTURE_ERROR", f"Unable to start tcpdump: {error}")
+            self._publish_health("CAPTURE_ERROR", f"Unable to start packet capture: {error}")
             return
 
         if self._process.stdout is None:
-            self._publish_health("CAPTURE_ERROR", "tcpdump stdout is unavailable.")
+            self._publish_health("CAPTURE_ERROR", "Capture stdout is unavailable.")
             return
+
+        chunks: queue.Queue[Optional[bytes]] = queue.Queue(maxsize=64)
+
+        def reader_loop() -> None:
+            try:
+                while not self._stop.is_set():
+                    chunk = os.read(self._process.stdout.fileno(), 65536)
+                    if not chunk:
+                        break
+                    try:
+                        chunks.put(chunk, timeout=1)
+                    except queue.Full:
+                        self._publish_health("CAPTURE_ERROR", "Capture reader queue overflowed; failing closed.")
+                        break
+            except OSError:
+                pass
+            finally:
+                try:
+                    chunks.put(None, timeout=0.2)
+                except queue.Full:
+                    pass
+
+        self._reader_thread = threading.Thread(target=reader_loop, name="capture-pipe-reader", daemon=True)
+        self._reader_thread.start()
 
         reader = PcapStreamReader()
         self._publish_health("LINK_UP_IDLE", "Capture started; waiting for qualifying IPv4/ARP traffic.")
         last_health = 0.0
 
         while not self._stop.is_set():
-            if self._process.poll() is not None:
-                self._publish_health("CAPTURE_ERROR", "tcpdump exited unexpectedly. Check capture permissions.")
+            if self._process.poll() is not None and chunks.empty():
+                self._publish_health(
+                    "CAPTURE_ERROR",
+                    "Capture process exited unexpectedly. On Windows, run PowerShell as Administrator and verify Npcap; on Linux, check capture permissions.",
+                )
                 return
 
+            chunk: Optional[bytes]
             try:
-                ready, _, _ = select.select([self._process.stdout], [], [], 0.5)
-            except (ValueError, OSError) as error:
-                self._publish_health("CAPTURE_ERROR", f"Capture stream error: {error}")
+                chunk = chunks.get(timeout=0.5)
+            except queue.Empty:
+                chunk = b""
+
+            if chunk is None:
+                if not self._stop.is_set():
+                    self._publish_health("CAPTURE_ERROR", "Capture stream closed unexpectedly.")
                 return
 
-            if ready:
-                try:
-                    chunk = os.read(self._process.stdout.fileno(), 65536)
-                except OSError as error:
-                    self._publish_health("CAPTURE_ERROR", f"Capture read failed: {error}")
-                    return
-                if not chunk:
-                    self._publish_health("CAPTURE_ERROR", "tcpdump capture stream closed.")
-                    return
-
+            if chunk:
                 try:
                     reader.feed(chunk)
                     records = reader.parse_available()
@@ -177,14 +271,11 @@ class CaptureWorker:
                     status = "CAPTURE_ACTIVE"
                     reason = "Current-session IPv4/ARP packets are actively being parsed."
                 else:
-                    # The OS RX counter covers all layer-2 traffic, while Stage 1
-                    # deliberately captures only IPv4/ARP. A rising RX counter
-                    # therefore cannot prove the filtered capture is stalled; it
-                    # may simply be IPv6 or other traffic. Do not manufacture a
-                    # CAPTURE_STALLED state from incomparable counters.
                     status = "LINK_UP_IDLE"
-                    reason = "Capture process is healthy but no recent qualifying IPv4/ARP packet was observed. Other layer-2 traffic may still be present."
-
+                    reason = (
+                        "Capture process is healthy but no recent qualifying IPv4/ARP packet was observed. "
+                        "Other layer-2 traffic may still be present."
+                    )
                 self._publish_health(status, reason)
                 last_health = current
 

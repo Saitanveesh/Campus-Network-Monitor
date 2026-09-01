@@ -2,15 +2,16 @@ name: Stage-1 unit tests
 
 on:
   push:
-    branches: [main, stage1-foundation]
+    branches: [main, stage1-foundation, windows-native]
   pull_request:
     branches: [main]
 
 jobs:
   unit-tests:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4

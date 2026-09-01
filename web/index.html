@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Campus Network Observatory</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:Arial,Helvetica,sans-serif;background:#f3f4f6;color:#111}header{background:#fff;border-bottom:1px solid #d5d5d5;padding:16px 20px;display:flex;justify-content:space-between;align-items:center;gap:16px}h1{margin:0;font-size:24px}.sub{font-size:11px;color:#666;margin-top:4px}a{color:#111}.wrap{padding:14px 16px 24px}.banner{background:#fff;border:1px solid #ccc;border-left:5px solid #111;padding:11px 13px;font-size:11px;margin-bottom:12px}.banner.bad{border-left-color:#999}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:9px;margin-bottom:12px}.card{background:#fff;border:1px solid #ddd;padding:12px;min-width:0}.card strong{display:block;font-size:19px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.card span{display:block;margin-top:5px;color:#666;font-size:9px}.panel{background:#fff;border:1px solid #ccc;padding:13px;margin-bottom:12px}.panel h2{font-size:16px;margin:0 0 4px}.note{font-size:10px;color:#777;line-height:1.45;margin-bottom:10px}.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.scroll{overflow:auto;max-height:300px}table{border-collapse:collapse;width:100%;font-size:10px}th{background:#eee;text-align:left;padding:7px;position:sticky;top:0}td{padding:7px;border-bottom:1px solid #eee}#offline{display:none;text-align:center;background:#fff;border:1px solid #bbb;padding:32px;margin-bottom:12px}#offline strong{display:block;font-size:20px;margin-bottom:8px}canvas{width:100%;height:220px;display:block}@media(max-width:1050px){.grid{grid-template-columns:repeat(3,1fr)}}@media(max-width:700px){.grid{grid-template-columns:repeat(2,1fr)}.two{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header><div><h1>Campus Network Observatory</h1><div class="sub">Current-session passive network instrumentation</div></div><a href="/topology.html">Open Live Communication Topology</a></header>
+<div class="wrap">
+<div id="banner" class="banner">Validating current sensor state...</div>
+<div id="offline"><strong id="offlineState">LIVE DATA UNAVAILABLE</strong><div id="offlineReason"></div></div>
+<div id="live" style="display:none">
+<div class="grid">
+<div class="card"><strong id="state">-</strong><span>Capture State</span></div>
+<div class="card"><strong id="iface">-</strong><span>Auto-Selected Interface</span></div>
+<div class="card"><strong id="sensor">-</strong><span>Sensor IPv4</span></div>
+<div class="card"><strong id="endpoints">0</strong><span>Verified Local Endpoints</span></div>
+<div class="card"><strong id="flows">0</strong><span>Active Flows</span></div>
+<div class="card"><strong id="rate">0 B/s</strong><span>Sensor-Visible Traffic</span></div>
+</div>
+<div class="grid">
+<div class="card"><strong id="pps">0</strong><span>Packets / Second</span></div>
+<div class="card"><strong id="parsed">0</strong><span>Parsed Packets</span></div>
+<div class="card"><strong id="rejected">0</strong><span>Rejected Packets</span></div>
+<div class="card"><strong id="gateway">-</strong><span>Default Gateway</span></div>
+<div class="card"><strong id="subnet">-</strong><span>Session Subnet</span></div>
+<div class="card"><strong id="session">-</strong><span>Session ID</span></div>
+</div>
+<div class="panel"><h2>Live Traffic</h2><div class="note">Only current-session samples are plotted. Session rotation clears the graph.</div><canvas id="chart"></canvas></div>
+<div class="two">
+<div class="panel"><h2>Verified Local Endpoints</h2><div class="note">Only source-side IPv4 or ARP evidence can create a local endpoint.</div><div class="scroll"><table><thead><tr><th>IP</th><th>MAC</th><th>Class</th><th>Evidence</th><th>Packets</th></tr></thead><tbody id="endpointRows"></tbody></table></div></div>
+<div class="panel"><h2>Current ARP Evidence</h2><div class="note">Passive sender observations from this session only.</div><div class="scroll"><table><thead><tr><th>IP</th><th>MAC</th><th>Observations</th></tr></thead><tbody id="arpRows"></tbody></table></div></div>
+</div>
+<div class="panel"><h2>Observed Flows</h2><div class="note">Off-subnet peers are communication peers, not counted as locally connected devices.</div><div class="scroll"><table><thead><tr><th>Source</th><th>Source Class</th><th>Destination</th><th>Destination Class</th><th>Protocol</th><th>Dst Port</th><th>Packets</th><th>Bytes</th></tr></thead><tbody id="flowRows"></tbody></table></div></div>
+</div>
+</div>
+<script>
+const q=id=>document.getElementById(id);let lastSession=null;let traffic=[];
+function fmtBytes(n){n=Number(n||0);if(n>=1e9)return(n/1e9).toFixed(2)+' GB';if(n>=1e6)return(n/1e6).toFixed(2)+' MB';if(n>=1e3)return(n/1e3).toFixed(2)+' KB';return n.toFixed(0)+' B'}
+async function get(path){const r=await fetch(path+(path.includes('?')?'&':'?')+'_='+Date.now(),{cache:'no-store'});if(!r.ok)throw new Error('request failed');return r.json()}
+function unavailable(status){q('live').style.display='none';q('offline').style.display='block';q('banner').className='banner bad';q('banner').textContent='FAIL-CLOSED • '+(status.state||'UNAVAILABLE');q('offlineState').textContent=status.state||'LIVE DATA UNAVAILABLE';q('offlineReason').textContent=status.reason||'Current evidence cannot be validated.';traffic=[];drawChart()}
+function renderRows(id,items,renderer,emptyCols){const body=q(id);body.innerHTML='';if(!items.length){body.innerHTML='<tr><td colspan="'+emptyCols+'">No current-session data.</td></tr>';return}for(const item of items){const tr=document.createElement('tr');tr.innerHTML=renderer(item);body.appendChild(tr)}}
+function drawChart(){const c=q('chart'),rect=c.getBoundingClientRect(),dpr=window.devicePixelRatio||1,w=Math.max(300,Math.floor(rect.width)),h=220;c.width=w*dpr;c.height=h*dpr;const x=c.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);x.clearRect(0,0,w,h);x.strokeStyle='#ddd';for(let i=0;i<5;i++){const y=15+i*45;x.beginPath();x.moveTo(55,y);x.lineTo(w-10,y);x.stroke()}if(traffic.length<2){x.fillStyle='#777';x.font='11px Arial';x.fillText('Waiting for current-session traffic samples...',70,40);return}const max=Math.max(1,...traffic.map(v=>Number(v.bytes_per_second||0)));x.beginPath();traffic.forEach((v,i)=>{const px=55+i/Math.max(traffic.length-1,1)*(w-70),py=195-Number(v.bytes_per_second||0)/max*180;i?x.lineTo(px,py):x.moveTo(px,py)});x.strokeStyle='#111';x.lineWidth=2;x.stroke();x.fillStyle='#555';x.font='10px Arial';x.fillText(fmtBytes(max)+'/s',4,18);x.fillText('0 B/s',15,198)}
+async function refresh(){try{const status=await get('/api/live/status');if(!status.live_data_available){unavailable(status);return}const snap=await get('/api/live/snapshot');if(!snap.status.live_data_available){unavailable(snap.status);return}if(lastSession&&lastSession!==status.session.session_id)traffic=[];lastSession=status.session.session_id;q('offline').style.display='none';q('live').style.display='block';q('banner').className='banner';q('banner').textContent='CURRENT SESSION ONLY • '+status.state+' • '+status.session.interface+' • '+status.session.sensor_ip+' • '+status.session.subnet;q('state').textContent=status.state;q('iface').textContent=status.session.interface;q('sensor').textContent=status.session.sensor_ip;q('gateway').textContent=status.session.gateway||'-';q('subnet').textContent=status.session.subnet;q('session').textContent=status.session.session_id.slice(0,8);q('parsed').textContent=Number(status.capture.parsed_packets||0).toLocaleString();q('rejected').textContent=Number(status.capture.rejected_packets||0).toLocaleString();const locals=snap.endpoints.filter(e=>e.classification==='LOCAL_SUBNET_ENDPOINT');q('endpoints').textContent=locals.length;q('flows').textContent=snap.flows.length;traffic=snap.traffic;const latest=traffic.length?traffic[traffic.length-1]:{};q('pps').textContent=Number(latest.packets_per_second||0).toFixed(1);q('rate').textContent=fmtBytes(latest.bytes_per_second||0)+'/s';renderRows('endpointRows',snap.endpoints,e=>`<td>${e.ip}</td><td>${e.mac}</td><td>${e.classification}</td><td>${e.evidence_type}</td><td>${Number(e.packets||0).toLocaleString()}</td>`,5);renderRows('arpRows',snap.arp,e=>`<td>${e.ip}</td><td>${e.mac}</td><td>${Number(e.observations||0).toLocaleString()}</td>`,3);renderRows('flowRows',snap.flows,f=>`<td>${f.source_ip}</td><td>${f.source_class}</td><td>${f.destination_ip}</td><td>${f.destination_class}</td><td>${f.protocol}</td><td>${f.destination_port??'-'}</td><td>${Number(f.packets||0).toLocaleString()}</td><td>${fmtBytes(f.bytes)}</td>`,8);drawChart()}catch(e){unavailable({state:'API_UNAVAILABLE',reason:'The integrated observatory API cannot currently validate live data.'})}}
+window.addEventListener('resize',drawChart);refresh();setInterval(refresh,2000);
+</script>
+</body>
+</html>
